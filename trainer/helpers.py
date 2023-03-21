@@ -272,13 +272,10 @@ def post_process_args(args):
     args.val_root = os.path.join(args.root, 'val')
     args.test_root = os.path.join(args.root, 'test')
     args.pretrained = eval(args.pretrained)
-    args.train = eval(args.train)
     args.save = eval(args.save)
-    args.subset_data = eval(args.subset_data)
     args.prune_loc = eval(args.prune_loc)
     if args.mode == 'plot_attn_dist':
         args.get_img_attns = True
-    # if subset data, take 10 default classes
     if args.device == 'gpu':
         args.device = "cuda:0" if torch.cuda.is_available() else "cpu"
     return args
