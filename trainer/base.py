@@ -216,8 +216,8 @@ class BaseTrainer(metaclass=abc.ABCMeta):
                 'epoch_timer (avg): {:.5f} hrs \n' \
                 'total time to converge: {:.2f} hrs \n' \
                 'throughput per sec: {:.2f}\n' \
-                'total gflops per image: {:.2f}' \
-                'finished at {}'
+                'total gflops per image: {:.2f} \n' \
+                'finished at {} \n'
                     .format(
                         self.forward_tm.avg, self.backward_tm.avg,
                         self.optimize_tm.avg, self.train_time.avg / 3600,
@@ -240,7 +240,7 @@ class BaseTrainer(metaclass=abc.ABCMeta):
                             .format(self.train_time.sum / 3600, self.train_time.avg / 3600))
                     f.write('\t throughput per sec: {:.2f} \n'.format(self.img_per_sec))
                     f.write('\t gflops per image: {:.2f} \n'.format(self.gflop_total_per_img))
-                    f.write(f'\t finished at: {datetime.datetime.now()}')
+                    f.write(f'\t finished at: {datetime.datetime.now()} \n')
                     f.write('=' * 50 + '\n')
 
         else:
@@ -254,7 +254,7 @@ class BaseTrainer(metaclass=abc.ABCMeta):
                     self.result_log['test_acc@1'], self.result_log['test_acc@3'], self.result_log['test_acc@5']))
                 f.write('\t throughput per sec: {:.2f} \n'.format(self.img_per_sec))
                 f.write('\t Total model gflops per image: {:.2f} \n'.format(self.gflop_total_per_img))
-                f.write(f'\t finished at: {datetime.datetime.now()}')
+                f.write(f'\t finished at: {datetime.datetime.now()} \n')
                 f.write('=' * 50 + '\n')
 
         with open(os.path.join(self.args.result_dir, 'model_arch.txt'), 'w') as f:

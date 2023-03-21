@@ -53,8 +53,6 @@ class VOCDataset(torchvision.datasets.VisionDataset):
         assert num_classes is None or len(self.classes) == self.num_classes, "Found n_classes doesn't match given n_classes"
         self.num_classes = len(classes)
 
-
-
     def __len__(self) -> int:
         return len(self.samples)
 

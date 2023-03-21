@@ -200,8 +200,6 @@ class Attention(nn.Module):
         self.distilled = distilled
         self.use_select_token = use_select_token
         self.prune_patch = prune_patch
-        if prune_patch:
-            self.PredictLG = PredictLG(dim)
         self.n_samples = n_samples
 
     def softmax_with_policy(self, attn, policy, eps=1e-6):
@@ -294,7 +292,6 @@ class Block(nn.Module):
         self.distilled = distilled
         self.prune_patch = prune_patch
         self.keep_rate = keep_rate
-
 
     def forward(self, x, sigma, get_idx=False, get_img_attn=False):
 
@@ -411,7 +408,6 @@ class adaPerturbedViT(nn.Module):
 
         self.init_weights(weight_init)
 
-
     def init_weights(self, mode=''):
         assert mode in ('jax', 'jax_nlhb', 'nlhb', '')
         head_bias = -math.log(self.num_classes) if 'nlhb' in mode else 0.
@@ -455,7 +451,7 @@ class adaPerturbedViT(nn.Module):
     def name(self):
         return "adaPerturbedViT"
 
-    def forward_features(self, x, sigma, get_idx=False, get_img_attn=False):
+    def forward_features(self, x, sigma=0, get_idx=False, get_img_attn=False):
         _, _, h, w = x.shape
 
         x = self.patch_embed(x)
@@ -503,7 +499,7 @@ class adaPerturbedViT(nn.Module):
         else:
             return x[:, 0], idxs, img_attns
 
-    def forward(self, x, sigma, get_idx=False, get_img_attn=False):
+    def forward(self, x, sigma=0, get_idx=False, get_img_attn=False):
         x, idxs, img_attns = self.forward_features(x, sigma, get_idx, get_img_attn)
         if self.head_dist is not None:
             x, x_dist = self.head(x[0]), self.head_dist(x[1])  # x must be a tuple
@@ -514,9 +510,9 @@ class adaPerturbedViT(nn.Module):
                 return (x + x_dist) / 2
         else:
             x = self.head(x)
-        result = (x, )
+        result = x
         if get_idx:
-            result += (idxs, )
+            result = (x, idxs)
         if get_img_attn:
             result += (img_attns, )
         return result
@@ -690,7 +686,7 @@ def _create_adavit(variant, pretrained=False, **kwargs):
 
     pretrained_cfg = resolve_pretrained_cfg(variant, pretrained_cfg=kwargs.pop('pretrained_cfg', None))
     model = build_model_with_cfg(
-        adaViT, variant, pretrained,
+        adaPerturbedViT, variant, pretrained,
         pretrained_cfg=pretrained_cfg,
         pretrained_filter_fn=checkpoint_filter_fn,
         pretrained_custom_load='npz' in pretrained_cfg['url'],

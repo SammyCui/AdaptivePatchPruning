@@ -27,7 +27,8 @@ def get_model_optimizer(args):
                              drop_block_rate=None,
                              img_size=(args.image_size, args.image_size),
                              keep_rate=args.keep_rate,
-                             prune_loc=args.prune_loc
+                             prune_loc=args.prune_loc,
+                             num_classes=args.num_classes
                              )
     elif 'evit' in args.model or 'shrink' in args.model:
         model = create_model(
