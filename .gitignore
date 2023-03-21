@@ -1,0 +1,13 @@
+**/*.git
+
+# Virtual Environment
+venv/*
+
+
+**/*.idea/
+**/__pycache__
+**/tflogger
+**/*.pyc
+
+**/.DS_Store
+**/*.log

@@ -24,6 +24,11 @@ def accuracy(output, target, topk=(1,)):
         maxk = max(topk)
         batch_size = target.size(0)
 
+        # for label smoothing, the target is a soft one-hot batched matrix with shape (B, num_classes)
+        # so change it to (B, )
+        if len(target.shape) > 1:
+            target = torch.argmax(target, dim=-1)
+
         _, pred = output.topk(maxk, 1, True, True)
         pred = pred.t()
         correct = pred.eq(target.view(1, -1).expand_as(pred))

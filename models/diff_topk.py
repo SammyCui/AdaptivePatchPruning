@@ -1,5 +1,10 @@
+from math import sqrt
+
+import numpy as np
 import torch
+from einops import rearrange
 from torch import nn
+import torch.nn.functional as F
 
 
 def HardTopK(k, x):
@@ -18,7 +23,32 @@ class PerturbedTopK(nn.Module):
     def __call__(self, x, sigma):
         return PerturbedTopKFunction.apply(x, self.k, self.num_samples, sigma)
 
+class PredictorLG(nn.Module):
+    """ Image to Patch Embedding
+    """
+    def __init__(self, embed_dim=384):
+        super().__init__()
+        self.in_conv = nn.Sequential(
+            nn.LayerNorm(embed_dim),
+            nn.Linear(embed_dim, embed_dim),
+            nn.GELU()
+        )
 
+        self.out_conv = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim // 2),
+            nn.GELU(),
+            nn.Linear(embed_dim // 2, embed_dim // 4),
+            nn.GELU(),
+            nn.Linear(embed_dim // 4, 1)
+        )
+
+    def forward(self, x):
+        x = self.in_conv(x)
+        B, N, C = x.size()
+        local_x = x[:,:, :C//2]
+        global_x = torch.mean(x[:,:, C//2:], dim=1, keepdim=True)
+        x = torch.cat([local_x, global_x.expand(B, N, C//2)], dim=-1)
+        return self.out_conv(x)
 
 class PerturbedTopKFunction(torch.autograd.Function):
     @staticmethod
@@ -63,3 +93,36 @@ class PerturbedTopKFunction(torch.autograd.Function):
         grad_input = torch.einsum("bkd,bkd->bd", grad_output, expected_gradient)
 
         return (grad_input,) + tuple([None] * 5)
+
+def batched_index_select(input, dim, index):
+    for i in range(1, len(input.shape)):
+        if i != dim:
+            index = index.unsqueeze(i)
+    expanse = list(input.shape)
+    expanse[0] = -1
+    expanse[dim] = -1
+    index = index.expand(expanse)
+    return torch.gather(input, dim, index)
+
+def extract_patches_from_indices(x, indices):
+    batch_size, _, channels = x.shape
+    k = indices.shape[-1]
+    patches = x
+    patches = batched_index_select(patches, 1, indices)
+    patches = patches.contiguous().view(batch_size, k, channels)
+    return patches
+
+
+def extract_patches_from_indicators(x, indicators):
+    indicators = rearrange(indicators, "b d k -> b k d")
+    patches = torch.einsum("b k d, b d c -> b k c",
+                           indicators, x)
+    return patches
+
+
+def min_max_norm(x):
+    flatten_score_min = x.min(axis=-1, keepdim=True).values
+    flatten_score_max = x.max(axis=-1, keepdim=True).values
+    norm_flatten_score = (x - flatten_score_min) / (flatten_score_max - flatten_score_min + 1e-5)
+    return norm_flatten_score
+

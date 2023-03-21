@@ -3,6 +3,8 @@ import json
 import torch
 import os
 import torch.nn.functional as F
+from timm.data import Mixup
+import datetime
 from utils.logger import Logger
 from utils.meters import AverageMeter, StatsMeter
 from utils.metric import accuracy
@@ -26,34 +28,46 @@ class BaseTrainer(metaclass=abc.ABCMeta):
 
         self.result_log = {'max_val_acc@1': 0,
                            'max_val_acc@1_epoch': 0}
-
-        self.model, self.optimizer, self.lr_scheduler = get_model_optimizer(args)
+        self.train_dataloader, self.val_dataloader, self.test_dataloader, num_classes = get_dataloaders(args)
+        args.num_classes = num_classes
+        self.model, self.criterion, self.optimizer, self.lr_scheduler = get_model_optimizer(args)
         self.model.to(self.device)
-        self.train_dataloader, self.val_dataloader, self.test_dataloader = get_dataloaders(args)
+
         self.img_per_sec = None
         self.best_model_params = None
         self.gflop_total_per_img = None
+
+        mixup_fn = None
+        mixup_active = args.mixup > 0 or args.cutmix > 0. or args.cutmix_minmax is not None
+        if mixup_active:
+            mixup_fn = Mixup(
+                mixup_alpha=args.mixup, cutmix_alpha=args.cutmix, cutmix_minmax=args.cutmix_minmax,
+                prob=args.mixup_prob, switch_prob=args.mixup_switch_prob, mode=args.mixup_mode,
+                label_smoothing=args.smoothing, num_classes=args.num_classes)
+        self.mixup_fn = mixup_fn
+
         print(json.dumps(vars(args), indent=2))
 
-    def _train_one_epoch(self, ):
+    def _train_one_epoch(self, **kwargs):
+
+        self.model.train()
+
         train_loss, train_acc_1, train_acc_3, train_acc_5 = (deepcopy(AverageMeter()) for _ in range(4))
-        for batch in self.train_dataloader:
+        for data, labels in self.train_dataloader:
 
             self.train_step += 1
+            data, labels = data.to(self.device), labels.to(self.device)
 
-            if self.args.per_size:
-                data, bb, labels = batch
-                data, bb, labels = data.to(self.device), bb.to(self.device), labels.to(self.device)
-                data = (data, bb)
-            else:
-                data, labels = batch
-                data, labels = (data.to(self.device),), labels.to(self.device)
+            if self.mixup_fn:
+                data, labels = self.mixup_fn(data, labels)
 
-            forward_t0 = timer()
-            outputs = self.model(*data)
-            forward_t1 = timer()
+            with torch.cuda.amp.autocast():
+                forward_t0 = timer()
+                outputs = self.model(data, **kwargs)
+                forward_t1 = timer()
 
-            loss = F.cross_entropy(outputs, labels)
+                loss = self.criterion(outputs, labels)
+
             acc_1, acc_3, acc_5 = accuracy(outputs, labels, topk=(1, 3, 5))
 
             self.optimizer.zero_grad()
@@ -75,7 +89,7 @@ class BaseTrainer(metaclass=abc.ABCMeta):
 
         if self.lr_scheduler:
             self.lr_scheduler.step()
-        val_acc_1, val_acc_3, val_acc_5, val_loss = self.validate()
+        val_acc_1, val_acc_3, val_acc_5, val_loss = self.validate(**kwargs)
 
         self.logging(train_loss=train_loss.avg, train_acc=train_acc_1.avg,
                      val_loss=val_loss, val_acc=val_acc_1)
@@ -86,25 +100,20 @@ class BaseTrainer(metaclass=abc.ABCMeta):
 
         for epoch in range(self.start_epoch, self.max_epoch+1):
             epoch_t0 = timer()
-            self.model.train()
             self._train_one_epoch()
             self.train_time.update(timer() - epoch_t0)
 
-    def _validate(self):
+    def _validate(self, **kwargs):
         self.model.eval()
         val_loss, val_acc_1, val_acc_3, val_acc_5 = (deepcopy(StatsMeter()) for _ in range(4))
         with torch.no_grad():
-            for batch in self.val_dataloader:
-                if self.args.per_size:
-                    data, bb, labels = batch
-                    data, bb, labels = data.to(self.device), bb.to(self.device), labels.to(self.device)
-                    data = (data, bb)
-                else:
-                    data, labels = batch
-                    data, labels = (data.to(self.device), ), labels.to(self.device)
-                outputs = self.model(*data)
+            for data, labels in self.val_dataloader:
 
-                loss = F.cross_entropy(outputs, labels)
+                data, labels = data.to(self.device), labels.to(self.device)
+                with torch.cuda.amp.autocast():
+                    outputs = self.model(data, **kwargs)
+
+                    loss = F.cross_entropy(outputs, labels)
                 acc_1, acc_3, acc_5 = accuracy(outputs, labels, topk=(1,3,5))
 
                 val_loss.update(loss.item())
@@ -115,9 +124,9 @@ class BaseTrainer(metaclass=abc.ABCMeta):
 
         return val_acc_1.avg, val_acc_3.avg, val_acc_5.avg, val_loss.avg
 
-    def validate(self):
+    def validate(self, **kwargs):
         if self.train_epoch % self.args.val_interval == 0:
-            val_acc_1, val_acc_3, val_acc_5, val_loss = self._validate()
+            val_acc_1, val_acc_3, val_acc_5, val_loss = self._validate(**kwargs)
 
             if val_acc_1 >= self.result_log['max_val_acc@1']:
                 self.result_log['max_val_acc@1'] = val_acc_1
@@ -158,7 +167,7 @@ class BaseTrainer(metaclass=abc.ABCMeta):
             self.logger.add_scalar('val_loss', val_loss, self.train_epoch)
             self.logger.add_scalar('val_acc@1', val_acc, self.train_epoch)
 
-    def test(self, param):
+    def test(self, param=None):
         print('==> Testing start')
         if param:
             self.model.load_state_dict(param)
@@ -166,17 +175,14 @@ class BaseTrainer(metaclass=abc.ABCMeta):
         t0 = timer()
         test_loss, test_acc_1, test_acc_3, test_acc_5 = (deepcopy(StatsMeter()) for _ in range(4))
         with torch.no_grad():
-            for batch in self.test_dataloader:
-                if self.args.per_size:
-                    data, bb, labels = batch
-                    data, bb, labels = data.to(self.device), bb.to(self.device), labels.to(self.device)
-                    data = (data, bb)
-                else:
-                    data, labels = batch
-                    data, labels = (data.to(self.device), ), labels.to(self.device)
-                outputs = self.model(*data)
+            for data, labels in self.test_dataloader:
 
-                loss = F.cross_entropy(outputs, labels)
+                data, labels = data.to(self.device), labels.to(self.device)
+
+                with torch.cuda.amp.autocast():
+                    outputs = self.model(data)
+                    loss = F.cross_entropy(outputs, labels)
+
                 acc_1, acc_3, acc_5 = accuracy(outputs, labels, topk=(1,3,5))
 
                 test_loss.update(loss.item())
@@ -186,7 +192,7 @@ class BaseTrainer(metaclass=abc.ABCMeta):
 
                 if not self.gflop_total_per_img:
                     flop_total = FlopCountAnalysis(self.model, data).total()
-                    self.gflop_total_per_img = flop_total // len(batch) / 1e9
+                    self.gflop_total_per_img = flop_total // labels.shape[0] / 1e9
 
         self.img_per_sec = (len(self.test_dataloader) * self.args.batch_size) / (timer() - t0)
 
@@ -209,14 +215,16 @@ class BaseTrainer(metaclass=abc.ABCMeta):
                 'optim_timer (avg): {:.2f} sec \n' \
                 'epoch_timer (avg): {:.5f} hrs \n' \
                 'total time to converge: {:.2f} hrs \n' \
-                'inference images: {:.2f} per sec\n' \
-                'total gflops per image: {:.2f}'
+                'throughput per sec: {:.2f}\n' \
+                'total gflops per image: {:.2f}' \
+                'finished at {}'
                     .format(
                         self.forward_tm.avg, self.backward_tm.avg,
                         self.optimize_tm.avg, self.train_time.avg / 3600,
                         self.train_time.sum / 3600,
                         self.img_per_sec,
-                        self.gflop_total_per_img
+                        self.gflop_total_per_img,
+                        datetime.datetime.now()
                     )
             )
             if self.args.write_to_collections:
@@ -228,14 +236,15 @@ class BaseTrainer(metaclass=abc.ABCMeta):
                         self.result_log['max_val_acc@1']))
                     f.write('\t Test acc@1={:.4f} acc@3={:.4f} acc@5={:.4f}\n'.format(
                         self.result_log['test_acc@1'], self.result_log['test_acc@3'], self.result_log['test_acc@5']))
-                    f.write('\t Total time to converge: {:.3f} hrs, per epoch: {:.5f} hrs \n'
+                    f.write('\t total time to converge: {:.3f} hrs, per epoch: {:.5f} hrs \n'
                             .format(self.train_time.sum / 3600, self.train_time.avg / 3600))
-                    f.write('\t Inference images: {:.2f} per sec \n'.format(self.img_per_sec))
-                    f.write('\t Total model gflops per image: {:.2f} \n'.format(self.gflop_total_per_img))
+                    f.write('\t throughput per sec: {:.2f} \n'.format(self.img_per_sec))
+                    f.write('\t gflops per image: {:.2f} \n'.format(self.gflop_total_per_img))
+                    f.write(f'\t finished at: {datetime.datetime.now()}')
                     f.write('=' * 50 + '\n')
 
         else:
-            print('inference images: {:.2f} per sec \n' \
+            print('throughput per sec: {:.2f} \n' \
                   'gflops per image: {:.2f}'.format(self.img_per_sec, self.gflop_total_per_img))
 
             with open(os.path.join(self.args.result_dir, 'results.txt'), 'w') as f:
@@ -243,8 +252,9 @@ class BaseTrainer(metaclass=abc.ABCMeta):
                 f.write(self.args.run_name + ': \n')
                 f.write('\t Test acc@1={:.4f} acc@3={:.4f} acc@5={:.4f}\n'.format(
                     self.result_log['test_acc@1'], self.result_log['test_acc@3'], self.result_log['test_acc@5']))
-                f.write('\t Inference images: {:.2f} per sec \n'.format(self.img_per_sec))
+                f.write('\t throughput per sec: {:.2f} \n'.format(self.img_per_sec))
                 f.write('\t Total model gflops per image: {:.2f} \n'.format(self.gflop_total_per_img))
+                f.write(f'\t finished at: {datetime.datetime.now()}')
                 f.write('=' * 50 + '\n')
 
         with open(os.path.join(self.args.result_dir, 'model_arch.txt'), 'w') as f:
@@ -253,8 +263,6 @@ class BaseTrainer(metaclass=abc.ABCMeta):
         self.logger.close()
 
     def __str__(self):
-
-
         return "{}({}). \n Args: {}".format(
             self.__class__.__name__,
             self.model.__class__.__name__,

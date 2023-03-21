@@ -50,6 +50,9 @@ class VOCDataset(torchvision.datasets.VisionDataset):
         self.class_to_idx = class_to_idx
         self.samples = samples
         self.targets = [s[1] for s in samples]
+        assert num_classes is None or len(self.classes) == self.num_classes, "Found n_classes doesn't match given n_classes"
+        self.num_classes = len(classes)
+
 
 
     def __len__(self) -> int:

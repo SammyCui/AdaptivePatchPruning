@@ -15,6 +15,7 @@ for some einops/einsum fun
 * Bert reference code checks against Huggingface Transformers and Tensorflow Bert
 Hacked together by / Copyright 2021 Ross Wightman
 # ------------------------------------------
+
 # Code taken from:  Youwei Liang
 """
 import math
@@ -384,7 +385,7 @@ class EViT(nn.Module):
     def name(self):
         return "EViT"
 
-    def forward_features(self, x, keep_rate=None, tokens=None, get_idx=False):
+    def forward_features(self, x, keep_rate=None, tokens=None, get_img_attn=False):
         _, _, h, w = x.shape
         if not isinstance(keep_rate, (tuple, list)):
             keep_rate = (keep_rate, ) * self.depth
@@ -417,7 +418,7 @@ class EViT(nn.Module):
         left_tokens = []
         idxs = []
         for i, blk in enumerate(self.blocks):
-            x, left_token, idx = blk(x, keep_rate[i], tokens[i], get_idx)
+            x, left_token, idx = blk(x, keep_rate[i], tokens[i], get_img_attn)
             left_tokens.append(left_token)
             if idx is not None:
                 idxs.append(idx)
@@ -427,8 +428,8 @@ class EViT(nn.Module):
         else:
             return x[:, 0], x[:, 1], idxs
 
-    def forward(self, x, keep_rate=None, tokens=None, get_idx=False):
-        x, _, idxs = self.forward_features(x, keep_rate, tokens, get_idx)
+    def forward(self, x, keep_rate=None, tokens=None, get_img_attn=False):
+        x, _, idxs = self.forward_features(x, keep_rate, tokens, get_img_attn)
         if self.head_dist is not None:
             x, x_dist = self.head(x[0]), self.head_dist(x[1])  # x must be a tuple
             if self.training and not torch.jit.is_scripting():
@@ -438,7 +439,7 @@ class EViT(nn.Module):
                 return (x + x_dist) / 2
         else:
             x = self.head(x)
-        if get_idx:
+        if get_img_attn:
             return x, idxs
         return x
 

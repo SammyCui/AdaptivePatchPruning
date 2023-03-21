@@ -20,12 +20,14 @@ Hacked together by / Copyright 2021 Ross Wightman
 import math
 import logging
 import sys
+from copy import deepcopy
 from functools import partial
 from collections import OrderedDict
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from einops import rearrange
 from timm import create_model
 
 from timm.data import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD, IMAGENET_INCEPTION_MEAN, IMAGENET_INCEPTION_STD
@@ -34,6 +36,7 @@ from timm.models.layers import trunc_normal_, lecun_normal_, to_2tuple
 from timm.models.registry import register_model
 
 from datasets.VOC import VOCDataset
+from models.diff_topk import PerturbedTopKFunction, extract_patches_from_indices
 from utils.func_utils import complement_idx
 
 _logger = logging.getLogger(__name__)
@@ -166,8 +169,25 @@ class PatchEmbed(nn.Module):
         return x
 
 
+class PredictLG(nn.Module):
+    def __init__(self, embed_dim):
+        super().__init__()
+        self.out = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim // 2),
+            nn.GELU(),
+            nn.Linear(embed_dim // 2, embed_dim // 4),
+            nn.GELU(),
+            nn.Linear(embed_dim // 4, 2),
+        )
+
+    def forward(self, x):
+        #TODO: test whether to add global policy from previous layers
+        return self.out(x)
+
+
 class Attention(nn.Module):
-    def __init__(self, dim, num_heads=8, qkv_bias=False, attn_drop=0., proj_drop=0., keep_rate=1., distilled=False):
+    def __init__(self, dim, num_heads=8, qkv_bias=False, attn_drop=0., proj_drop=0., distilled=False,
+                 use_select_token=False, prune_patch=False, n_samples=500):
         super().__init__()
         self.num_heads = num_heads
         head_dim = dim // num_heads
@@ -177,103 +197,145 @@ class Attention(nn.Module):
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
-        self.keep_rate = keep_rate
-        assert 0 < keep_rate <= 1, "keep_rate must > 0 and <= 1, got {0}".format(keep_rate)
+        self.distilled = distilled
+        self.use_select_token = use_select_token
+        self.prune_patch = prune_patch
+        if prune_patch:
+            self.PredictLG = PredictLG(dim)
+        self.n_samples = n_samples
 
-    def forward(self, x, keep_rate=None, tokens=None):
-        if keep_rate is None:
-            keep_rate = self.keep_rate
+    def softmax_with_policy(self, attn, policy, eps=1e-6):
+        B, N, _ = policy.size()
+        B, H, N, N = attn.size()
+        attn_policy = policy.reshape(B, 1, 1, N)  # * policy.reshape(B, 1, N, 1)
+        eye = torch.eye(N, dtype=attn_policy.dtype, device=attn_policy.device).view(1, 1, N, N)
+        attn_policy = attn_policy + (1.0 - attn_policy) * eye
+        max_att = torch.max(attn, dim=-1, keepdim=True)[0]
+        attn = attn - max_att
+        # attn = attn.exp_() * attn_policy
+        # return attn / attn.sum(dim=-1, keepdim=True)
+
+        # for stable training
+        attn = attn.to(torch.float32).exp_() * attn_policy.to(torch.float32)
+        attn = (attn + eps/N) / (attn.sum(dim=-1, keepdim=True) + eps)
+        return attn.type_as(max_att)
+
+    def forward(self, x, keep_rate=1, sigma=0.05):
+
         B, N, C = x.shape
+
+        n_extra_tokens = 1 # assume there is always a cls_token
+
+        if self.distilled:
+            n_extra_tokens += 1
+
+        if self.use_select_token:
+            n_extra_tokens += 1
+
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]   # make torchscript happy (cannot use tensor as tuple)
 
         attn = (q @ k.transpose(-2, -1)) * self.scale
         attn = attn.softmax(dim=-1)
+
+        # whether to use the cls_token, or use an extra token
+        if not self.use_select_token:
+            img_attn = attn[:, :, 0, 1:] if not self.distilled else attn[:, :, 1, 2:] # [B, H, N-1]
+        else:
+            img_attn = attn[:, :, 1, 2:] if not self.distilled else attn[:, :, 2, 3:]
+        img_attn = img_attn.mean(dim=1)  # [B, N-1] #TODO: test to be splitted across heads
         attn = self.attn_drop(attn)
 
         x = (attn @ v).transpose(1, 2).reshape(B, N, C)
         x = self.proj(x)
         x = self.proj_drop(x)
-# TODO: In practice, we start at a high temperature and anneal to a small but non-zero temperature.
-        left_tokens = N - 1
-        if self.keep_rate < 1 and keep_rate < 1 or tokens is not None:  # double check the keep rate
-            left_tokens = math.ceil(keep_rate * (N - 1))
-            if tokens is not None:
-                left_tokens = tokens
-            if left_tokens == N - 1:
-                return x, None, None, None, left_tokens
-            assert left_tokens >= 1
 
-            select_attn = attn[:, :, 1, 2:] if not self.distilled else attn[:, :, 2, 3:]  # [B, H, N-1]
-            select_attn = select_attn.mean(dim=1)  # [B, N-1] #TODO: test to be splitted across heads
-            select_attn = F.gumbel_softmax(select_attn, dim=-1)
-            # TODO: plain gumbel-softmax doesn't work for topk operation. Change to the one used in dynamicViT.
-            # TODO: for topk, use perturbed optimizer
-            _, idx = torch.topk(select_attn, left_tokens, dim=1, largest=True, sorted=True)  # [B, left_tokens]
-            # cls_idx = torch.zeros(B, 1, dtype=idx.dtype, device=idx.device)
-            # index = torch.cat([cls_idx, idx + 1], dim=1)
-            index = idx.unsqueeze(-1).expand(-1, -1, C)  # [B, left_tokens, C]
+        if self.prune_patch:
+            # keep_logits = self.PredictLG(img_attn)
+            # TODO: For Gumbel-softmax in practice, we start at a high temperature and anneal to a small but non-zero temperature.
+            # hard_keep_decision = F.gumbel_softmax(keep_logits, hard=True)[:, :, 0:1]
+            # cls_policy = torch.ones(B, image_tokens_start_idx, 1, dtype=hard_keep_decision.dtype, device=hard_keep_decision.device)
+            # policy = torch.cat([cls_policy, hard_keep_decision], dim=1)
+            # attn = self.softmax_with_policy(attn, policy)
+            # keep_idx = hard_keep_decision.non_zero()
 
-            return x, index, idx, select_attn, left_tokens
+            n_left_tokens = math.ceil(keep_rate * (N - n_extra_tokens))
 
-        return  x, None, None, None, left_tokens
+            if self.training:
+                keep_idx = PerturbedTopKFunction.apply(img_attn, n_left_tokens, self.n_samples, sigma)
+            else:
+                #TODO: Note the train-test difference in soft vs hard TopK op. To bridge this, we linearly set sigma -> 0 during training
+                keep_idx = torch.topk(img_attn, k=n_left_tokens, dim=-1, sorted=False)
+                keep_idx = keep_idx.indices  # b, k
+                keep_idx = torch.sort(keep_idx, dim=-1).values
+
+        else:
+            keep_idx = torch.arange(img_attn.shape[1]).unsqueeze(0).unsqueeze(-1).expand(B, -1, C)
+
+        return  x, keep_idx, img_attn
 
 
 class Block(nn.Module):
 
     def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, drop=0., attn_drop=0.,
-                 drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm, keep_rate=0.,
-                 fuse_token=False):
+                 drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm, distilled=False,
+                 use_select_token=False, keep_rate=1, prune_patch=False):
         super().__init__()
         self.norm1 = norm_layer(dim)
         self.attn = Attention(dim, num_heads=num_heads, qkv_bias=qkv_bias,
-                              attn_drop=attn_drop, proj_drop=drop, keep_rate=keep_rate)
+                              attn_drop=attn_drop, proj_drop=drop, prune_patch=prune_patch)
         # NOTE: drop path for stochastic depth, we shall see if this is better than dropout here
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         self.norm2 = norm_layer(dim)
         mlp_hidden_dim = int(dim * mlp_ratio)
         self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
-        self.keep_rate = keep_rate
         self.mlp_hidden_dim = mlp_hidden_dim
-        self.fuse_token = fuse_token
+        self.use_select_token = use_select_token
+        self.distilled = distilled
+        self.prune_patch = prune_patch
+        self.keep_rate = keep_rate
 
-    def forward(self, x, keep_rate=None, tokens=None, get_idx=False):
-        if keep_rate is None:
-            keep_rate = self.keep_rate  # this is for inference, use the default keep rate
-        B, N, C = x.shape
 
-        tmp, index, idx, cls_attn, left_tokens = self.attn(self.norm1(x), keep_rate, tokens)
+    def forward(self, x, sigma, get_idx=False, get_img_attn=False):
+
+        n_extra_tokens = 1  # assume there is always a cls_token
+
+        if self.distilled:
+            n_extra_tokens += 1
+
+        if self.use_select_token:
+            n_extra_tokens += 1
+
+        # img_attn is the un-pruned cls_attn version ,the full cls_attn without dropping the inattentive attns
+        tmp, keep_idx, img_attn = self.attn(self.norm1(x), keep_rate=self.keep_rate, sigma=sigma)
         x = x + self.drop_path(tmp)
 
-        if index is not None:
-            # B, N, C = x.shape
-            non_cls = x[:, 1:]
-            x_others = torch.gather(non_cls, dim=1, index=index)  # [B, left_tokens, C]
+        if self.prune_patch:
 
-            if self.fuse_token:
-                compl = complement_idx(idx, N - 1)  # [B, N-1-left_tokens]
-                non_topk = torch.gather(non_cls, dim=1, index=compl.unsqueeze(-1).expand(-1, -1, C))  # [B, N-1-left_tokens, C]
-
-                non_topk_attn = torch.gather(cls_attn, dim=1, index=compl)  # [B, N-1-left_tokens]
-                extra_token = torch.sum(non_topk * non_topk_attn.unsqueeze(-1), dim=1, keepdim=True)  # [B, 1, C]
-                x = torch.cat([x[:, 0:1], x_others, extra_token], dim=1)
+            if self.training:
+                img_x = torch.einsum("b k n, b n c -> b k c", keep_idx, x[:, n_extra_tokens:, :])
             else:
-                x = torch.cat([x[:, 0:1], x_others], dim=1)
+                img_x = extract_patches_from_indices(x, keep_idx)
+            x = torch.cat((x[:, :n_extra_tokens, :], img_x), dim=1)
 
+        keep_idx = torch.argmax(keep_idx, dim=-1)
         x = x + self.drop_path(self.mlp(self.norm2(x)))
-        n_tokens = x.shape[1] - 1
-        if get_idx and index is not None:
-            return x, n_tokens, idx
-        return x, n_tokens, None
+
+        result = (x, )
+
+        result += (keep_idx, ) if get_idx else (None, )
+        result += (img_attn, ) if get_img_attn else (None, )
+
+        return result
 
 
-class adaViT(nn.Module):
+class adaPerturbedViT(nn.Module):
     """ adaViT """
 
     def __init__(self, img_size=224, patch_size=16, in_chans=3, num_classes=1000, embed_dim=768, depth=12,
                  num_heads=12, mlp_ratio=4., qkv_bias=True, representation_size=None, distilled=False,
                  drop_rate=0., attn_drop_rate=0., drop_path_rate=0., embed_layer=PatchEmbed, norm_layer=None,
-                 act_layer=None, weight_init='', keep_rate=(1, ), fuse_token=False):
+                 act_layer=None, weight_init='', use_select_token=False, prune_loc=None, keep_rate=1):
         """
         Args:
             img_size (int, tuple): input image size
@@ -293,21 +355,20 @@ class adaViT(nn.Module):
             embed_layer (nn.Module): patch embedding layer
             norm_layer: (nn.Module): normalization layer
             weight_init: (str): weight init scheme
+            use_select_token: (bool): whether to use cls_token for patch selection, or use an additional token
         """
         super().__init__()
         self.img_size = img_size
-        if len(keep_rate) == 1:
-            keep_rate = keep_rate * depth
-        self.keep_rate = keep_rate
+        if not prune_loc:
+            self.prune_loc = ()
         self.depth = depth
-        self.first_shrink_idx = depth
-        for i, s in enumerate(keep_rate):
-            if s < 1:
-                self.first_shrink_idx = i
-                break
         self.num_classes = num_classes
         self.num_features = self.embed_dim = embed_dim  # num_features for consistency with other models
-        self.num_tokens = 2 if distilled else 1
+        self.num_tokens = 1
+        if distilled:
+            self.num_tokens += 1
+        if use_select_token:
+            self.num_tokens += 1
         norm_layer = norm_layer or partial(nn.LayerNorm, eps=1e-6)
         act_layer = act_layer or nn.GELU
 
@@ -316,7 +377,9 @@ class adaViT(nn.Module):
         num_patches = self.patch_embed.num_patches
 
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
-        self.select_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        self.use_select_token = use_select_token
+        if use_select_token:
+            self.select_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
         self.dist_token = nn.Parameter(torch.zeros(1, 1, embed_dim)) if distilled else None
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + self.num_tokens, embed_dim))
         self.pos_drop = nn.Dropout(p=drop_rate)
@@ -326,7 +389,7 @@ class adaViT(nn.Module):
             Block(
                 dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, drop=drop_rate,
                 attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer, act_layer=act_layer,
-                keep_rate=keep_rate[i], fuse_token=fuse_token)
+                prune_patch=i in prune_loc, use_select_token=use_select_token, keep_rate=keep_rate)
             for i in range(depth)])
         self.norm = norm_layer(embed_dim)
 
@@ -348,6 +411,7 @@ class adaViT(nn.Module):
 
         self.init_weights(weight_init)
 
+
     def init_weights(self, mode=''):
         assert mode in ('jax', 'jax_nlhb', 'nlhb', '')
         head_bias = -math.log(self.num_classes) if 'nlhb' in mode else 0.
@@ -359,7 +423,8 @@ class adaViT(nn.Module):
             named_apply(partial(_init_vit_weights, head_bias=head_bias, jax_impl=True), self)
         else:
             trunc_normal_(self.cls_token, std=.02)
-            trunc_normal_(self.select_token, std=.02)
+            if self.use_select_token:
+                trunc_normal_(self.select_token, std=.02)
             self.apply(_init_vit_weights)
 
     def _init_weights(self, m):
@@ -388,23 +453,25 @@ class adaViT(nn.Module):
 
     @property
     def name(self):
-        return "adaViT"
+        return "adaPerturbedViT"
 
-    def forward_features(self, x, keep_rate=None, tokens=None, get_idx=False):
+    def forward_features(self, x, sigma, get_idx=False, get_img_attn=False):
         _, _, h, w = x.shape
-        if not isinstance(keep_rate, (tuple, list)):
-            keep_rate = (keep_rate, ) * self.depth
-        if not isinstance(tokens, (tuple, list)):
-            tokens = (tokens, ) * self.depth
-        assert len(keep_rate) == self.depth
-        assert len(tokens) == self.depth
+
         x = self.patch_embed(x)
         cls_token = self.cls_token.expand(x.shape[0], -1, -1)  # stole cls_tokens impl from Phil Wang, thanks
-        select_token = self.select_token.expand(x.shape[0], -1, -1)
+        if self.use_select_token:
+            select_token = self.select_token.expand(x.shape[0], -1, -1)
         if self.dist_token is None:
-            x = torch.cat((cls_token, select_token, x), dim=1)
+            if self.use_select_token:
+                x = torch.cat((cls_token, select_token, x), dim=1)
+            else:
+                x = torch.cat((cls_token, x), dim=1)
         else:
-            x = torch.cat((cls_token, select_token, self.dist_token.expand(x.shape[0], -1, -1), x), dim=1)
+            if self.use_select_token:
+                x = torch.cat((cls_token, self.dist_token.expand(x.shape[0], -1, -1), select_token, x), dim=1)
+            else:
+                x = torch.cat((cls_token, self.dist_token.expand(x.shape[0], -1, -1), x), dim=1)
 
         # for input with another resolution, interpolate the positional embedding.
         # used for finetining a ViT on images with larger size.
@@ -421,21 +488,23 @@ class adaViT(nn.Module):
 
         x = self.pos_drop(x + pos_embed)
 
-        left_tokens = []
         idxs = []
+        img_attns = []
         for i, blk in enumerate(self.blocks):
-            x, left_token, idx = blk(x, keep_rate[i], tokens[i], get_idx)
-            left_tokens.append(left_token)
+            x, idx, img_attn = blk(x, sigma, get_idx, get_img_attn)
+            if img_attn is not None:
+                img_attns.append(img_attn)
             if idx is not None:
                 idxs.append(idx)
+
         x = self.norm(x)
         if self.dist_token is None:
-            return self.pre_logits(x[:, 0]), left_tokens, idxs
+            return self.pre_logits(x[:, 0]), idxs, img_attns
         else:
-            return x[:, 0], x[:, 1], idxs
+            return x[:, 0], idxs, img_attns
 
-    def forward(self, x, keep_rate=None, tokens=None, get_idx=False):
-        x, _, idxs = self.forward_features(x, keep_rate, tokens, get_idx)
+    def forward(self, x, sigma, get_idx=False, get_img_attn=False):
+        x, idxs, img_attns = self.forward_features(x, sigma, get_idx, get_img_attn)
         if self.head_dist is not None:
             x, x_dist = self.head(x[0]), self.head_dist(x[1])  # x must be a tuple
             if self.training and not torch.jit.is_scripting():
@@ -445,9 +514,12 @@ class adaViT(nn.Module):
                 return (x + x_dist) / 2
         else:
             x = self.head(x)
+        result = (x, )
         if get_idx:
-            return x, idxs
-        return x
+            result += (idxs, )
+        if get_img_attn:
+            result += (img_attns, )
+        return result
 
 
 def _init_vit_weights(module: nn.Module, name: str = '', head_bias: float = 0., jax_impl: bool = False):
@@ -486,7 +558,7 @@ def _init_vit_weights(module: nn.Module, name: str = '', head_bias: float = 0., 
 
 
 @torch.no_grad()
-def _load_weights(model: AEViT, checkpoint_path: str, prefix: str = ''):
+def _load_weights(model: adaPerturbedViT, checkpoint_path: str, prefix: str = ''):
     """ Load weights from .npz checkpoints for official Google Brain Flax implementation
     """
     import numpy as np
@@ -598,48 +670,58 @@ def checkpoint_filter_fn(state_dict, model):
             # For old models that I trained prior to conv based patchification
             O, I, H, W = model.patch_embed.proj.weight.shape
             v = v.reshape(O, -1, H, W)
-        elif k == 'pos_embed' and v.shape != model.pos_embed.shape:
-            # To resize pos embedding when using model at different size from pretrained weights
-            v = resize_pos_embed(
-                v, model.pos_embed, getattr(model, 'num_tokens', 1), model.patch_embed.grid_size)
+        elif k == 'pos_embed':
+            if model.name == 'adaViT' and model.use_select_token:
+                # here I just assume there is a cls_token at index 0 of the pos_embed
+                cls_tok = v[:, 0:1, :]
+                image_tok = v[:, 1:, :]
+                v = torch.cat((cls_tok.expand(-1, 2, -1), image_tok), dim=1)
+            if v.shape != model.pos_embed.shape:
+                # To resize pos embedding when using model at different size from pretrained weights
+                v = resize_pos_embed(
+                    v, model.pos_embed, getattr(model, 'num_tokens', 1), model.patch_embed.grid_size)
         out_dict[k] = v
     return out_dict
 
 
-def _create_aevit(variant, pretrained=False, **kwargs):
+def _create_adavit(variant, pretrained=False, **kwargs):
     if kwargs.get('features_only', None):
         raise RuntimeError('features_only not implemented for Vision Transformer models.')
 
     pretrained_cfg = resolve_pretrained_cfg(variant, pretrained_cfg=kwargs.pop('pretrained_cfg', None))
     model = build_model_with_cfg(
-        AEViT, variant, pretrained,
+        adaViT, variant, pretrained,
         pretrained_cfg=pretrained_cfg,
         pretrained_filter_fn=checkpoint_filter_fn,
         pretrained_custom_load='npz' in pretrained_cfg['url'],
         pretrained_strict=False,
         **kwargs)
 
-    if pretrained:
-        model.select_token.load_state_dict(model.cls_token.state_dict())
+    if pretrained and kwargs.get('use_select_token', False):
+        model.select_token = deepcopy(model.cls_token)
     return model
 
 
 @register_model
-def deit_small_patch16_aevit(pretrained=False, base_keep_rate=0.7, drop_loc=(3, 6, 9), **kwargs):
-    keep_rate = [1] * 12
-    for loc in drop_loc:
-        keep_rate[loc] = base_keep_rate
-    model_kwargs = dict(patch_size=16, embed_dim=384, depth=12, num_heads=6, keep_rate=keep_rate)
+def deit_small_patch16_adaperturbed_vit(pretrained=False, prune_loc=(3, 6, 9), **kwargs):
+
+    model_kwargs = dict(patch_size=16, embed_dim=384, depth=12, num_heads=6, prune_loc=prune_loc)
     model_kwargs.update(kwargs)
-    model = _create_aevit('deit_small_patch16_224', pretrained=pretrained, **model_kwargs)
+    model = _create_adavit('deit_small_patch16_224', pretrained=pretrained, **model_kwargs)
     return model
 
 
 if __name__ == '__main__':
-    evit_small = create_model('deit_small_patch16_aevit', pretrained=True)
+    evit_small = create_model('deit_small_patch16_adaperturbed_vit', pretrained=True, use_select_token=False, prune_loc=(3,6,9), keep_rate=.7)
     from PIL import Image
     from torchvision import transforms
     root = '/Users/xuanmingcui/Documents/cnslab/VOC2012_filtered'
+    img = torch.rand((2,3,224,224))
+    evit_small.eval()
+    out, img_attn = evit_small(img, get_img_attn=True)
+    for i in img_attn:
+        print(i.shape)
+
 
 
 
