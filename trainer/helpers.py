@@ -14,12 +14,11 @@ from torchvision.transforms import transforms
 from models import adavit, evit
 from datasets.VOC import VOCDataset
 
-
 DEFAULT_ROOT = '/u/erdos/students/xcui32/SequentialTraining/datasets/VOC2012/VOC2012_filtered/'
 DEFAULT_CLS = ['aeroplane', 'bicycle', 'bird', 'boat', 'bottle', 'bus', 'car', 'cat', 'chair', 'cow']
 
-def get_model_optimizer(args):
 
+def get_model_optimizer(args):
     if 'ada' in args.model:
         model = create_model(args.model,
                              pretrained=args.pretrained,
@@ -47,15 +46,24 @@ def get_model_optimizer(args):
         raise NotImplementedError("Model not implemented")
 
     if args.optimizer == 'sgd':
-        optimizer = optim.SGD(model.parameters(),
-                              lr=args.lr,
-                              momentum=args.momentum,
-                              weight_decay=args.weight_decay)
+        if args.pretrained:
+            optimizer = optim.SGD([{'params': model.head.parameters(), 'lr': args.lr * 100}],
+                                  lr=args.lr,
+                                  momentum=args.momentum,
+                                  weight_decay=args.weight_decay)
+        else:
+            optimizer = optim.SGD(model.parameters(),
+                                  lr=args.lr,
+                                  momentum=args.momentum,
+                                  weight_decay=args.weight_decay)
     elif args.optimizer == 'adam':
-        optimizer = optim.Adam(model.parameters(), lr=args.lr)
+        if args.pretrained:
+            optimizer = optim.Adam([{'params': model.head.parameters(), 'lr': args.lr * 100}], lr=args.lr)
+        else:
+            optimizer = optim.Adam(model.parameters(), lr=args.lr)
 
     else:
-        raise Exception("Unknown optimizer")
+        raise NotImplementedError("Unknown optimizer")
 
     if args.lr_scheduler:
         if args.lr_scheduler == 'step':
@@ -88,7 +96,6 @@ def get_model_optimizer(args):
         criterion = LabelSmoothingCrossEntropy(smoothing=args.smoothing)
     else:
         criterion = torch.nn.CrossEntropyLoss()
-
 
     if args.resume:
         checkpoint = torch.load(args.resume, map_location='cpu')
@@ -137,21 +144,20 @@ def build_transform(is_train, args):
     return transforms.Compose(t)
 
 
-
 def get_dataloaders(args):
     train_transform = build_transform(is_train=True, args=args)
     val_transform = build_transform(is_train=True, args=args)
 
     # train_dataset = torchvision.datasets.CIFAR10(root='./dataset', train=True, transform=transform, download=True)
     # val_dataset = torchvision.datasets.CIFAR10(root='./dataset', train=False, transform=transform, download=True)
-    train_dataset = VOCDataset(root=os.path.join(args.train_root, 'root'), anno_root=os.path.join(args.train_root, 'annotations'),
-                               cls_to_use=args.cls_to_use,
+    train_dataset = VOCDataset(root=os.path.join(args.train_root, 'root'),
+                               anno_root=os.path.join(args.train_root, 'annotations'),
                                transform=train_transform)
-    val_dataset = VOCDataset(root=os.path.join(args.val_root, 'root'), anno_root=os.path.join(args.val_root, 'annotations'),
-                            cls_to_use=args.cls_to_use,
-                            transform=val_transform)
-    test_dataset = VOCDataset(root=os.path.join(args.test_root, 'root'), anno_root=os.path.join(args.test_root, 'annotations'),
-                              cls_to_use=args.cls_to_use,
+    val_dataset = VOCDataset(root=os.path.join(args.val_root, 'root'),
+                             anno_root=os.path.join(args.val_root, 'annotations'),
+                             transform=val_transform)
+    test_dataset = VOCDataset(root=os.path.join(args.test_root, 'root'),
+                              anno_root=os.path.join(args.test_root, 'annotations'),
                               transform=val_transform)
 
     train_num_classes = train_dataset.num_classes
@@ -160,16 +166,13 @@ def get_dataloaders(args):
 
     assert train_num_classes == val_num_classes == test_num_classes, "num_classes between train, val and test don't match"
 
-
     train_dataloader = DataLoader(train_dataset, batch_size=args.batch_size, num_workers=args.num_workers, shuffle=True)
-    val_dataloader   = DataLoader(val_dataset,   batch_size=args.batch_size, num_workers=args.num_workers, shuffle=True)
-    test_dataloader  = DataLoader(test_dataset,  batch_size=args.batch_size, num_workers=args.num_workers, shuffle=True)
+    val_dataloader = DataLoader(val_dataset, batch_size=args.batch_size, num_workers=args.num_workers, shuffle=True)
+    test_dataloader = DataLoader(test_dataset, batch_size=args.batch_size, num_workers=args.num_workers, shuffle=True)
     return train_dataloader, val_dataloader, test_dataloader, train_num_classes
 
 
-
 def args_parser():
-
     parser = argparse.ArgumentParser()
     parser.add_argument('--run_name', type=str)
     parser.add_argument('--root', type=str, nargs='?', const=DEFAULT_ROOT, default=DEFAULT_ROOT)
@@ -199,7 +202,8 @@ def args_parser():
     parser.add_argument('--max_epoch', type=int, default=100)
     parser.add_argument('--lr', type=float, default=0.001)
     parser.add_argument('--optimizer', type=str, default='adam')
-    parser.add_argument('--lr_scheduler', type=str, default=None, choices=['multistep', 'step', 'cosine'], nargs='?', const=None)
+    parser.add_argument('--lr_scheduler', type=str, default=None, choices=['multistep', 'step', 'cosine'], nargs='?',
+                        const=None)
     parser.add_argument('--step_size', type=int, default=10)
     parser.add_argument('--gamma', type=float, default=0.2)  # for lr_scheduler
     parser.add_argument('--momentum', type=float, default=0.9)
@@ -231,7 +235,6 @@ def args_parser():
     parser.add_argument('--resplit', action='store_true', default=False,
                         help='Do not random erase first (clean) augmentation split')
 
-
     # Mixup params
     parser.add_argument('--mixup', type=float, default=0.8,
                         help='mixup alpha, mixup enabled if > 0. (default: 0.8)')
@@ -245,7 +248,6 @@ def args_parser():
                         help='Probability of switching to cutmix when both mixup and cutmix enabled')
     parser.add_argument('--mixup-mode', type=str, default='batch',
                         help='How to apply mixup/cutmix params. Per "batch", "pair", or "elem"')
-
 
     # training devices and logging
     parser.add_argument('--num_workers', type=int, default=16)
@@ -267,7 +269,6 @@ def args_parser():
 
 
 def post_process_args(args):
-
     args.train_root = os.path.join(args.root, 'train')
     args.val_root = os.path.join(args.root, 'val')
     args.test_root = os.path.join(args.root, 'test')
@@ -300,11 +301,11 @@ class DebugArgs:
                  mode: str = 'plot_attn_dist',
                  sigma: float = 0.1,
                  decay_sigma: bool = True,
-                 num_classes: int =20,
+                 num_classes: int = 20,
                  momentum: float = 0.9,
                  weight_decay: float = 0.0005,
                  train: bool = True,
-                 prune_loc = (3,6,9),
+                 prune_loc=(3, 6, 9),
                  val_interval: int = 1,
                  keep_rate: float = 1,
                  num_workers: int = 1,
@@ -336,7 +337,6 @@ class DebugArgs:
                  save: bool = False,
                  resume: bool = False,
                  init_backbone: bool = False):
-
         self.root = root
         self.write_to_collections = write_to_collections
         self.run_name = run_name

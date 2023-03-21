@@ -208,7 +208,7 @@ class BaseTrainer(metaclass=abc.ABCMeta):
         for k, v in self.result_log.items():
             print(k, ': ', '{:.3f}'.format(v))
 
-        if self.args.train:
+        if self.args.mode == 'train':
             print(
                 'forward_timer  (avg): {:.2f} sec  \n' \
                 'backward_timer (avg): {:.2f} sec, \n' \
