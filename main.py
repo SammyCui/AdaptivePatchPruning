@@ -1,12 +1,12 @@
 from trainer.adavitTrainer import adavitTrainer
 from trainer.base import BaseTrainer
-from trainer.helpers import args_parser, DebugArgs
+from trainer.setup import args_parser, DebugArgs
 
 # libgcc_s = ctypes.CDLL('libgcc_s.so.1')
 
 
 if __name__ == '__main__':
-    args = args_parser()
+    # args = args_parser()
     args= DebugArgs(model='deit_small_patch16_adaperturbed_vit', mode='train', keep_rate=0.7, batch_size=4, save_n_batch=5)
 
     if 'vit' in args.model or 'deit' in args.model:

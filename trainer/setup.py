@@ -48,7 +48,9 @@ def get_model_optimizer(args):
 
     if args.optimizer == 'sgd':
         if args.pretrained:
-            optimizer = optim.SGD([{'params': model.head.parameters(), 'lr': args.lr * 100}],
+            optimizer = optim.SGD([{'params': model.blocks.parameters(), 'name': "blocks"},
+                                   {'params': model.norm.parameters(), 'lr': args.lr * 100, 'name': "norm"},
+                                   {'params': model.head.parameters(), 'lr': args.lr * 100, 'name': "head"}],
                                   lr=args.lr,
                                   momentum=args.momentum,
                                   weight_decay=args.weight_decay)
@@ -59,12 +61,15 @@ def get_model_optimizer(args):
                                   weight_decay=args.weight_decay)
     elif args.optimizer == 'adam':
         if args.pretrained:
-            optimizer = optim.Adam([{'params': model.head.parameters(), 'lr': args.lr * 100}], lr=args.lr)
+            optimizer = optim.Adam([{'params': model.blocks.parameters(), 'name': "blocks"},
+                                   {'params': model.norm.parameters(), 'lr': args.lr * 100, 'name': "norm"},
+                                   {'params': model.head.parameters(), 'lr': args.lr * 100, 'name': "head"}],
+                                   lr=args.lr)
         else:
             optimizer = optim.Adam(model.parameters(), lr=args.lr)
 
     else:
-        raise NotImplementedError("Unknown optimizer")
+        raise NotImplementedError("Optimizer not implemented")
 
     if args.lr_scheduler:
         if args.lr_scheduler == 'step':
@@ -147,7 +152,7 @@ def build_transform(is_train, args):
 
 def get_dataloaders(args):
     train_transform = build_transform(is_train=True, args=args)
-    val_transform = build_transform(is_train=True, args=args)
+    val_transform = build_transform(is_train=False, args=args)
 
     # train_dataset = torchvision.datasets.CIFAR10(root='./dataset', train=True, transform=transform, download=True)
     # val_dataset = torchvision.datasets.CIFAR10(root='./dataset', train=False, transform=transform, download=True)

@@ -514,7 +514,7 @@ class adaPerturbedViT(nn.Module):
         if get_idx:
             result = (x, idxs)
         if get_img_attn:
-            result += (img_attns, )
+            result = (x, img_attns) if not get_idx else (x, idxs, img_attns)
         return result
 
 
@@ -713,7 +713,7 @@ if __name__ == '__main__':
     from torchvision import transforms
     root = '/Users/xuanmingcui/Documents/cnslab/VOC2012_filtered'
     img = torch.rand((2,3,224,224))
-    evit_small.eval()
+    # evit_small.eval()
     out, img_attn = evit_small(img, get_img_attn=True)
     for i in img_attn:
         print(i.shape)

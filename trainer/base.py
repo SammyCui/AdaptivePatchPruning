@@ -10,7 +10,7 @@ from utils.meters import AverageMeter, StatsMeter
 from utils.metric import accuracy
 from timeit import default_timer as timer
 from copy import deepcopy
-from trainer.helpers import get_model_optimizer, get_dataloaders
+from trainer.setup import get_model_optimizer, get_dataloaders
 from fvcore.nn import FlopCountAnalysis
 
 
@@ -155,13 +155,17 @@ class BaseTrainer(metaclass=abc.ABCMeta):
         assert self.optimizer is not None, "Has not initialize optimizer yet."
 
         if self.train_epoch % self.args.val_interval == 0:
-            print('epoch {}/{}, **Train** loss={:.4f} acc={:.4f} | ' \
-                  '**Val** loss={:.4f} acc@1={:.4f}, lr={:.4g}'
-                  .format(self.train_epoch,
-                          self.max_epoch,
-                          train_loss, train_acc,
-                          val_loss, val_acc,
-                          self.optimizer.param_groups[0]['lr']))
+            log_str = 'epoch {}/{}, **Train** loss={:.4f} acc={:.4f} | ' \
+                  '**Val** loss={:.4f} acc@1={:.4f}'.format(self.train_epoch,
+                                                      self.max_epoch,
+                                                      train_loss, train_acc,
+                                                      val_loss, val_acc)
+            for param_group in self.optimizer.param_groups:
+                log_str += " lr_{}={:.4g}".format(
+                    param_group['name'],
+                    param_group['lr']
+                )
+
             self.logger.add_scalar('train_loss', train_loss, self.train_epoch)
             self.logger.add_scalar('train_acc', train_acc, self.train_epoch)
             self.logger.add_scalar('val_loss', val_loss, self.train_epoch)
