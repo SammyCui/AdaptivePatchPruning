@@ -161,10 +161,11 @@ class BaseTrainer(metaclass=abc.ABCMeta):
                                                       train_loss, train_acc,
                                                       val_loss, val_acc)
             for param_group in self.optimizer.param_groups:
-                log_str += " lr_{}={:.4g}".format(
-                    param_group['name'],
+                log_str += " lr{}={:.4g}".format(
+                    "-" + param_group['name'] if 'name' in param_group else "",
                     param_group['lr']
                 )
+            print(log_str)
 
             self.logger.add_scalar('train_loss', train_loss, self.train_epoch)
             self.logger.add_scalar('train_acc', train_acc, self.train_epoch)

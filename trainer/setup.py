@@ -46,28 +46,20 @@ def get_model_optimizer(args):
     else:
         raise NotImplementedError("Model not implemented")
 
-    if args.optimizer == 'sgd':
-        if args.pretrained:
-            optimizer = optim.SGD([{'params': model.blocks.parameters(), 'name': "blocks"},
-                                   {'params': model.norm.parameters(), 'lr': args.lr * 100, 'name': "norm"},
-                                   {'params': model.head.parameters(), 'lr': args.lr * 100, 'name': "head"}],
-                                  lr=args.lr,
-                                  momentum=args.momentum,
-                                  weight_decay=args.weight_decay)
-        else:
-            optimizer = optim.SGD(model.parameters(),
-                                  lr=args.lr,
-                                  momentum=args.momentum,
-                                  weight_decay=args.weight_decay)
-    elif args.optimizer == 'adam':
-        if args.pretrained:
-            optimizer = optim.Adam([{'params': model.blocks.parameters(), 'name': "blocks"},
-                                   {'params': model.norm.parameters(), 'lr': args.lr * 100, 'name': "norm"},
-                                   {'params': model.head.parameters(), 'lr': args.lr * 100, 'name': "head"}],
-                                   lr=args.lr)
-        else:
-            optimizer = optim.Adam(model.parameters(), lr=args.lr)
+    if args.pretrained and args.per_layer_lr:
+        training_params = [{'params': model.blocks.parameters(), 'name': "blocks"},
+                               {'params': model.norm.parameters(),   'name': "norm"},
+                               {'params': model.head.parameters(), 'lr': args.lr * 100, 'name': "head"}]
+    else:
+        training_params = model.parameters()
 
+    if args.optimizer == 'sgd':
+        optimizer = optim.SGD(training_params,
+                              lr=args.lr,
+                              momentum=args.momentum,
+                              weight_decay=args.weight_decay)
+    elif args.optimizer == 'adam':
+        optimizer = optim.Adam(training_params, lr=args.lr)
     else:
         raise NotImplementedError("Optimizer not implemented")
 
@@ -98,7 +90,7 @@ def get_model_optimizer(args):
     if args.mixup > 0.:
         # smoothing is handled with mixup label transform
         criterion = SoftTargetCrossEntropy()
-    elif args.smoothing:
+    elif args.smoothing > 0:
         criterion = LabelSmoothingCrossEntropy(smoothing=args.smoothing)
     else:
         criterion = torch.nn.CrossEntropyLoss()
@@ -210,6 +202,7 @@ def args_parser():
     parser.add_argument('--optimizer', type=str, default='adam')
     parser.add_argument('--lr_scheduler', type=str, default=None, choices=['multistep', 'step', 'cosine'], nargs='?',
                         const=None)
+    parser.add_argument('--per_layer_lr', type=str, default='False')
     parser.add_argument('--step_size', type=int, default=10)
     parser.add_argument('--gamma', type=float, default=0.2)  # for lr_scheduler
     parser.add_argument('--momentum', type=float, default=0.9)
@@ -281,6 +274,7 @@ def post_process_args(args):
     args.pretrained = eval(args.pretrained)
     args.save = eval(args.save)
     args.prune_loc = eval(args.prune_loc)
+    args.per_layer_lr = eval(args.per_layer_lr)
     if args.mode == 'plot_attn_dist':
         args.get_img_attns = True
     if args.device == 'gpu':

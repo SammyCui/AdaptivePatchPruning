@@ -7,7 +7,7 @@ from trainer.setup import args_parser, DebugArgs
 
 if __name__ == '__main__':
     # args = args_parser()
-    args= DebugArgs(model='deit_small_patch16_adaperturbed_vit', mode='train', keep_rate=0.7, batch_size=4, save_n_batch=5)
+    args= DebugArgs(model='deit_small_patch16_adaperturbed_vit', mode='train', keep_rate=0.7, batch_size=4, save_n_batch=5, mixup=0, smoothing=0, cutmix=0)
 
     if 'vit' in args.model or 'deit' in args.model:
         trainer = adavitTrainer(args)
