@@ -26,12 +26,12 @@ python3 /u/erdos/cnslab/xcui32/AdaptivePatchPruning/main.py \
  --root '/u/erdos/students/xcui32/SequentialTraining/datasets/VOC2012/VOC2012_filtered/' \
  --mode train --model deit_small_patch16_shrink_base \
  --keep_rate 0.7 --prune_loc "(3,6,9)" --sigma 0.1 \
- --mixup 0 --smoothing 0 --cutmix 0\
+ --mixup 0.8 --smoothing 0.1 --cutmix 1\
  --result_dir "/u/erdos/cnslab/xcui32/AdaptivePatchPruning/results/$RUN_NAME" \
  --write_to_collections "/u/erdos/cnslab/xcui32/AdaptivePatchPruning/results/results_vit.txt" --run_name $RUN_NAME \
  --save False --resume --pretrained True \
  --image_size 224 \
- --start_epoch 0 --max_epoch 50  \
+ --start_epoch 0 --max_epoch 50 --train_head_only False \
  --lr 0.0001 --optimizer adam --lr_scheduler cosine --step_size 20 --gamma 0.2 \
  --momentum 0.9  --weight_decay 0.0005 --val_interval 1 \
  --num_workers 16 --batch_size 64 --device 'cuda:0' --download False

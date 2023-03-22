@@ -46,10 +46,17 @@ def get_model_optimizer(args):
     else:
         raise NotImplementedError("Model not implemented")
 
+
+    if args.train_head_only:
+        for name, param in model.named_parameters():
+            if not name.startwith('head'):
+                param.requires_grad = False
+
+
     if args.pretrained and args.per_layer_lr:
         training_params = [{'params': model.blocks.parameters(), 'name': "blocks"},
-                               {'params': model.norm.parameters(),   'name': "norm"},
-                               {'params': model.head.parameters(), 'lr': args.lr * 100, 'name': "head"}]
+                           {'params': model.norm.parameters(),   'name': "norm"},
+                           {'params': model.head.parameters(), 'lr': args.lr * 100, 'name': "head"}]
     else:
         training_params = model.parameters()
 
@@ -197,6 +204,7 @@ def args_parser():
 
     # training params.
     parser.add_argument('--start_epoch', type=int, default=0)
+    parser.add_argument('--train_head_only', type=str, default='False')
     parser.add_argument('--max_epoch', type=int, default=100)
     parser.add_argument('--lr', type=float, default=0.001)
     parser.add_argument('--optimizer', type=str, default='adam')
@@ -275,6 +283,7 @@ def post_process_args(args):
     args.save = eval(args.save)
     args.prune_loc = eval(args.prune_loc)
     args.per_layer_lr = eval(args.per_layer_lr)
+    args.train_head_only = eval(args.train_head_only)
     if args.mode == 'plot_attn_dist':
         args.get_img_attns = True
     if args.device == 'gpu':
@@ -300,6 +309,7 @@ class DebugArgs:
                  gamma: float = 0.2,
                  mode: str = 'plot_attn_dist',
                  sigma: float = 0.1,
+                 train_head_only=False,
                  decay_sigma: bool = True,
                  num_classes: int = 20,
                  momentum: float = 0.9,
@@ -312,6 +322,7 @@ class DebugArgs:
                  save_n_batch: int = 1,
                  color_jitter=0.4,
                  aa='rand-m9-mstd0.5-inc1',
+                 per_layer_lr=True,
                  smoothing=0.1,
                  train_interpolation='bicubic',
                  repeated_aug=True,
@@ -353,6 +364,7 @@ class DebugArgs:
         self.recount = recount
         self.resplit = resplit
         self.mixup = mixup
+        self.per_layer_lr = per_layer_lr
         self.cutmix = cutmix
         self.cutmix_minmax = cutmix_minmax
         self.mixup_prob = mixup_prob
@@ -364,6 +376,7 @@ class DebugArgs:
         self.num_workers = num_workers
         self.num_classes = num_classes
         self.start_epoch = start_epoch
+        self.train_head_only = train_head_only
         self.sigma = sigma
         self.decay_sigma = decay_sigma
         self.fuse_token = fuse_token
