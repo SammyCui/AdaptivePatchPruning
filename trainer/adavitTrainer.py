@@ -69,7 +69,7 @@ class adavitTrainer(BaseTrainer):
             else:
                 break
 
-    def plot_attn_dist(self):
+    def plot_attn_dist(self, mode, log_scale=False):
         self.model.eval()
         save_n_batch = self.args.save_n_batch
 
@@ -81,8 +81,12 @@ class adavitTrainer(BaseTrainer):
 
                 with torch.cuda.amp.autocast():
                     output, img_attns = self.model(images, get_img_attn = True)
-                    img_attns = [einops.rearrange(img_attn, "B N -> (B N)") for img_attn in img_attns]
-                img_attns = np.array([layer.detach().numpy() for layer in img_attns ])
+                    img_attns = np.array([layer.detach().numpy() for layer in img_attns]) # 12 B N
+                    # img_attns = [einops.rearrange(img_attn, "B N -> (B N)") for img_attn in img_attns]
+                    # if log_scale:
+                    #     img_attns = np.array([torch.log(layer).detach().numpy() for layer in img_attns])
+                    # else:
+                    #     img_attns = np.array([layer.detach().numpy() for layer in img_attns])
 
                 # denormalize
                 mean = torch.tensor(IMAGENET_DEFAULT_MEAN, device=self.device).reshape(3, 1, 1)
@@ -92,38 +96,29 @@ class adavitTrainer(BaseTrainer):
                 if  total_layers_attns is None:
                     total_layers_attns = img_attns
                 else:
-                    np.append(total_layers_attns, img_attns, axis=-1)
-
-
-
-                # for idx, layer in enumerate(img_attns):
-                #     if idx % 3 != 0:
-                #         continue
-                #     attn = layer[0].detach().numpy()
-                #     print(f"layer {idx},  mean={np.mean(attn, axis=-1)}, median={np.median(attn, axis=-1)}, "
-                #           f"skewness={scipy.stats.skew(attn, axis=-1)}, kurtosis={scipy.stats.kurtosis(attn, axis=-1)}")
-                #     sb.histplot(attn, element='poly', fill=False, label=idx)
-                # plt.legend()
-                #
-                # # kde = gaussian_kde(self.model.attns[0][0].detach().numpy())
-                # # dist_space = linspace(min(self.model.attns[0][0].detach().numpy()), max(self.model.attns[0][0].detach().numpy()), 100)
-                # # # plot the results
-                # # plt.plot(dist_space, kde(dist_space))
-                # plt.show()
-                # t = transforms.ToPILImage()
-                # concat_img = t(images[0])
-                # concat_img.show()
+                    total_layers_attns = np.append(total_layers_attns, img_attns, axis=1)
 
                 save_n_batch -= 1
             else:
                 break
 
-        for idx, layer in enumerate(total_layers_attns):
-            if idx % 3 != 0:
-                continue
-            print(f"layer {idx},  mean={np.mean(layer, axis=-1)}, median={np.median(layer, axis=-1)}, "
-                  f"skewness={scipy.stats.skew(layer, axis=-1)}, kurtosis={scipy.stats.kurtosis(layer, axis=-1)}")
-            sb.histplot(layer, element='poly', fill=False, label=idx)
-        plt.legend()
-        plt.show()
+        for m in mode:
+            for idx, layer in enumerate(total_layers_attns):
+                if idx % 3 != 0:
+                    continue
+
+                if m =='dist':
+                    img_attn = einops.rearrange(layer, "B N -> (B N)")
+                    if log_scale:
+                        img_attn = np.log(img_attn)
+
+                    print(f"layer {idx},  mean={np.mean(img_attn, axis=-1)}, median={np.median(img_attn, axis=-1)}, "
+                          f"skewness={scipy.stats.skew(img_attn, axis=-1)}, kurtosis={scipy.stats.kurtosis(img_attn, axis=-1)}")
+                    sb.histplot(img_attn, element='poly', fill=False, label=idx)
+                elif m =='rank':
+                    img_attn = np.sort(layer, axis=-1).mean(axis=0)
+                    plt.plot(img_attn, label=idx)
+
+            plt.legend()
+            plt.show()
 

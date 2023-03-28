@@ -36,7 +36,7 @@ from timm.models.layers import trunc_normal_, lecun_normal_, to_2tuple
 from timm.models.registry import register_model
 
 from datasets.VOC import VOCDataset
-from models.diff_topk import PerturbedTopKFunction, extract_patches_from_indices
+from models.diff_topk import PerturbedTopKFunction, extract_patches_from_indices, diff_topk
 from utils.func_utils import complement_idx
 
 _logger = logging.getLogger(__name__)
@@ -187,7 +187,7 @@ class PredictLG(nn.Module):
 
 class Attention(nn.Module):
     def __init__(self, dim, num_heads=8, qkv_bias=False, attn_drop=0., proj_drop=0., distilled=False,
-                 use_select_token=False, prune_patch=False, n_samples=500):
+                 use_select_token=False, prune_patch=False, num_samples=500, noise='normal'):
         super().__init__()
         self.num_heads = num_heads
         head_dim = dim // num_heads
@@ -198,9 +198,10 @@ class Attention(nn.Module):
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
         self.distilled = distilled
+        self.noise = noise
         self.use_select_token = use_select_token
         self.prune_patch = prune_patch
-        self.n_samples = n_samples
+        self.num_samples = num_samples
 
     def softmax_with_policy(self, attn, policy, eps=1e-6):
         B, N, _ = policy.size()
@@ -260,7 +261,9 @@ class Attention(nn.Module):
             n_left_tokens = math.ceil(keep_rate * (N - n_extra_tokens))
 
             if self.training:
-                keep_idx = PerturbedTopKFunction.apply(img_attn, n_left_tokens, self.n_samples, sigma)
+                # keep_idx = PerturbedTopKFunction.apply(img_attn, n_left_tokens, self.num_samples, sigma)
+
+                keep_idx = diff_topk(img_attn, n_left_tokens, self.num_samples, sigma, self.noise)
             else:
                 #TODO: Note the train-test difference in soft vs hard TopK op. To bridge this, we linearly set sigma -> 0 during training
                 keep_idx = torch.topk(img_attn, k=n_left_tokens, dim=-1, sorted=False)
@@ -277,11 +280,12 @@ class Block(nn.Module):
 
     def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, drop=0., attn_drop=0.,
                  drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm, distilled=False,
-                 use_select_token=False, keep_rate=1, prune_patch=False):
+                 use_select_token=False, keep_rate=1, prune_patch=False, num_samples=1000, noise='normal'):
         super().__init__()
         self.norm1 = norm_layer(dim)
         self.attn = Attention(dim, num_heads=num_heads, qkv_bias=qkv_bias,
-                              attn_drop=attn_drop, proj_drop=drop, prune_patch=prune_patch)
+                              attn_drop=attn_drop, proj_drop=drop, prune_patch=prune_patch,
+                              use_select_token=use_select_token, noise=noise)
         # NOTE: drop path for stochastic depth, we shall see if this is better than dropout here
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         self.norm2 = norm_layer(dim)
@@ -292,6 +296,7 @@ class Block(nn.Module):
         self.distilled = distilled
         self.prune_patch = prune_patch
         self.keep_rate = keep_rate
+        self.num_samples = num_samples
 
     def forward(self, x, sigma, get_idx=False, get_img_attn=False):
 
@@ -332,7 +337,7 @@ class adaPerturbedViT(nn.Module):
     def __init__(self, img_size=224, patch_size=16, in_chans=3, num_classes=1000, embed_dim=768, depth=12,
                  num_heads=12, mlp_ratio=4., qkv_bias=True, representation_size=None, distilled=False,
                  drop_rate=0., attn_drop_rate=0., drop_path_rate=0., embed_layer=PatchEmbed, norm_layer=None,
-                 act_layer=None, weight_init='', use_select_token=False, prune_loc=None, keep_rate=1):
+                 act_layer=None, weight_init='', use_select_token=False, prune_loc=None, keep_rate=1, num_samples=1000, noise='normal'):
         """
         Args:
             img_size (int, tuple): input image size
@@ -369,14 +374,15 @@ class adaPerturbedViT(nn.Module):
         norm_layer = norm_layer or partial(nn.LayerNorm, eps=1e-6)
         act_layer = act_layer or nn.GELU
 
+
         self.patch_embed = embed_layer(
             img_size=img_size, patch_size=patch_size, in_chans=in_chans, embed_dim=embed_dim)
         num_patches = self.patch_embed.num_patches
 
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
         self.use_select_token = use_select_token
-        if use_select_token:
-            self.select_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+
+        self.select_token = nn.Parameter(torch.zeros(1, 1, embed_dim)) if use_select_token else None
         self.dist_token = nn.Parameter(torch.zeros(1, 1, embed_dim)) if distilled else None
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + self.num_tokens, embed_dim))
         self.pos_drop = nn.Dropout(p=drop_rate)
@@ -386,7 +392,7 @@ class adaPerturbedViT(nn.Module):
             Block(
                 dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, drop=drop_rate,
                 attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer, act_layer=act_layer,
-                prune_patch=i in prune_loc, use_select_token=use_select_token, keep_rate=keep_rate)
+                prune_patch=i in prune_loc, use_select_token=use_select_token, keep_rate=keep_rate, num_samples=num_samples, noise=noise)
             for i in range(depth)])
         self.norm = norm_layer(embed_dim)
 
@@ -449,23 +455,22 @@ class adaPerturbedViT(nn.Module):
 
     @property
     def name(self):
-        return "adaPerturbedViT"
+        return "adaViT"
 
     def forward_features(self, x, sigma=0, get_idx=False, get_img_attn=False):
         _, _, h, w = x.shape
 
         x = self.patch_embed(x)
         cls_token = self.cls_token.expand(x.shape[0], -1, -1)  # stole cls_tokens impl from Phil Wang, thanks
-        if self.use_select_token:
-            select_token = self.select_token.expand(x.shape[0], -1, -1)
+
         if self.dist_token is None:
             if self.use_select_token:
-                x = torch.cat((cls_token, select_token, x), dim=1)
+                x = torch.cat((cls_token, self.select_token.expand(x.shape[0], -1, -1), x), dim=1)
             else:
                 x = torch.cat((cls_token, x), dim=1)
         else:
             if self.use_select_token:
-                x = torch.cat((cls_token, self.dist_token.expand(x.shape[0], -1, -1), select_token, x), dim=1)
+                x = torch.cat((cls_token, self.dist_token.expand(x.shape[0], -1, -1), self.select_token.expand(x.shape[0], -1, -1), x), dim=1)
             else:
                 x = torch.cat((cls_token, self.dist_token.expand(x.shape[0], -1, -1), x), dim=1)
 

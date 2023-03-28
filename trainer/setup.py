@@ -24,11 +24,14 @@ def get_model_optimizer(args):
                              pretrained=args.pretrained,
                              drop_rate=args.drop,
                              drop_path_rate=args.drop_path,
+                             use_select_token=args.use_select_token,
                              drop_block_rate=None,
                              img_size=(args.image_size, args.image_size),
                              keep_rate=args.keep_rate,
+                             num_samples=args.num_samples,
                              prune_loc=args.prune_loc,
-                             num_classes=args.num_classes
+                             num_classes=args.num_classes,
+                             noise=args.noise
                              )
     elif 'evit' in args.model or 'shrink' in args.model:
         model = create_model(
@@ -44,12 +47,13 @@ def get_model_optimizer(args):
         )
 
     else:
-        raise NotImplementedError("Model not implemented")
+        # default to deit/vit
+        model = create_model(args.model)
 
 
     if args.train_head_only:
         for name, param in model.named_parameters():
-            if not name.startwith('head'):
+            if not name.startswith('head', 'select_token', 'cls_token'):
                 param.requires_grad = False
 
 
@@ -189,10 +193,15 @@ def args_parser():
 
     parser.add_argument('--keep_rate', type=float, default=0.7,
                         help="Fixed keep ratio for evit")
+    parser.add_argument('--use_select_token', type=str, default='False',
+                        help="Whether to use an additional token for patch scoring")
     parser.add_argument('--prune_loc', default='(3, 6, 9)', type=str,
                         help='the layer indices for patch pruning')
     parser.add_argument('--sigma', type=float, default=0.1,
                         help="Starting sigma for perturbed optimizer.")
+    parser.add_argument('--noise', type=str, default='normal', choices=['normal', 'gumbel'])
+    parser.add_argument('--num_samples', type=int, default=1000,
+                        help="Number of samples for perturbation optimizer")
     parser.add_argument('--decay_sigma', type=str, default='True',
                         help="Linearly decay sigma to 0 over epochs for perturbed optimizer.")
     parser.add_argument('--fuse_token', action='store_true',
@@ -284,6 +293,7 @@ def post_process_args(args):
     args.prune_loc = eval(args.prune_loc)
     args.per_layer_lr = eval(args.per_layer_lr)
     args.train_head_only = eval(args.train_head_only)
+    args.use_select_token = eval(args.use_select_token)
     if args.mode == 'plot_attn_dist':
         args.get_img_attns = True
     if args.device == 'gpu':
@@ -310,8 +320,10 @@ class DebugArgs:
                  mode: str = 'plot_attn_dist',
                  sigma: float = 0.1,
                  train_head_only=False,
+                 noise='normal',
                  decay_sigma: bool = True,
                  num_classes: int = 20,
+                 use_select_token=False,
                  momentum: float = 0.9,
                  weight_decay: float = 0.0005,
                  train: bool = True,
@@ -338,6 +350,7 @@ class DebugArgs:
                  mixup_switch_prob=0.5,
                  mixup_mode='batch',
                  batch_size: int = 2,
+                 num_samples=1000,
                  drop_path: float = 0.1,
                  fuse_token: bool = True,
                  pretrained: bool = True,
@@ -352,6 +365,7 @@ class DebugArgs:
         self.write_to_collections = write_to_collections
         self.run_name = run_name
         self.image_size = image_size
+        self.num_samples = num_samples
         self.model = model
         self.color_jitter = color_jitter
         self.aa = aa
@@ -363,6 +377,7 @@ class DebugArgs:
         self.remode = remode
         self.recount = recount
         self.resplit = resplit
+        self.noise = noise
         self.mixup = mixup
         self.per_layer_lr = per_layer_lr
         self.cutmix = cutmix
@@ -372,6 +387,7 @@ class DebugArgs:
         self.mixup_mode = mixup_mode
         self.save_n_batch = save_n_batch
         self.drop = drop
+        self.use_select_token = use_select_token
         self.download = download
         self.num_workers = num_workers
         self.num_classes = num_classes
